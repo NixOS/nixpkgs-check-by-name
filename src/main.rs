@@ -1,24 +1,24 @@
-use crate::nix_file::NixFileStore;
-use std::panic;
 mod eval;
 mod nix_file;
 mod nixpkgs_problem;
 mod ratchet;
 mod references;
+mod status;
 mod structure;
 mod utils;
 mod validation;
 
+use anyhow::Context as _;
+use clap::Parser;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::{panic, thread};
+
+use crate::nix_file::NixFileStore;
+use crate::status::{ColoredStatus, Status};
 use crate::structure::check_structure;
 use crate::validation::Validation::Failure;
 use crate::validation::Validation::Success;
-use anyhow::Context;
-use clap::Parser;
-use colored::Colorize;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::thread;
 
 /// Program to check the validity of pkgs/by-name
 ///
@@ -47,14 +47,9 @@ pub struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    match process(args.base, args.nixpkgs, &mut io::stderr()) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
-        Err(e) => {
-            eprintln!("{} {:#}", "I/O error: ".yellow(), e);
-            ExitCode::from(2)
-        }
-    }
+    let status: ColoredStatus = process(args.base, args.nixpkgs).into();
+    eprintln!("{status}");
+    status.into()
 }
 
 /// Does the actual work. This is the abstraction used both by `main` and the tests.
@@ -62,85 +57,33 @@ fn main() -> ExitCode {
 /// # Arguments
 /// - `base_nixpkgs`: Path to the base Nixpkgs to run ratchet checks against.
 /// - `main_nixpkgs`: Path to the main Nixpkgs to check.
-/// - `error_writer`: An `io::Write` value to write validation errors to, if any.
-///
-/// # Return value
-/// - `Err(e)` if an I/O-related error `e` occurred.
-/// - `Ok(false)` if there are problems, all of which will be written to `error_writer`.
-/// - `Ok(true)` if there are no problems
-pub fn process<W: io::Write>(
-    base_nixpkgs: PathBuf,
-    main_nixpkgs: PathBuf,
-    error_writer: &mut W,
-) -> anyhow::Result<bool> {
-    // Very easy to parallelise this, since it's totally independent
+fn process(base_nixpkgs: PathBuf, main_nixpkgs: PathBuf) -> Status {
+    // Very easy to parallelise this, since both operations are totally independent of each other.
     let base_thread = thread::spawn(move || check_nixpkgs(&base_nixpkgs));
-    let main_result = check_nixpkgs(&main_nixpkgs)?;
+    let main_result = match check_nixpkgs(&main_nixpkgs) {
+        Ok(result) => result,
+        Err(error) => {
+            return error.into();
+        }
+    };
 
     let base_result = match base_thread.join() {
-        Ok(res) => res?,
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return error.into();
+        }
         Err(e) => panic::resume_unwind(e),
     };
 
     match (base_result, main_result) {
-        (Failure(_), Failure(errors)) => {
-            // The base branch fails, the PR doesn't fix it, and the PR may also introduce
-            // additional problems.
-            for error in errors {
-                writeln!(error_writer, "{}", error.to_string().red())?
-            }
-            writeln!(
-                error_writer,
-                "{}",
-                "The base branch is broken and still has above problems with this PR, \
-                which need to be fixed first.\nConsider reverting the PR that introduced \
-                these problems in order to prevent more failures of unrelated PRs."
-                    .yellow()
-            )?;
-            Ok(false)
-        }
-        (Failure(_), Success(_)) => {
-            writeln!(
-                error_writer,
-                "{}",
-                "The base branch is broken, but this PR fixes it. Nice job!".green()
-            )?;
-            Ok(true)
-        }
-        (Success(_), Failure(errors)) => {
-            for error in errors {
-                writeln!(error_writer, "{}", error.to_string().red())?
-            }
-            writeln!(
-                error_writer,
-                "{}",
-                "This PR introduces the problems listed above. \
-                Please fix them before merging, otherwise the base branch would break."
-                    .yellow()
-            )?;
-            Ok(false)
-        }
+        (Failure(..), Failure(errors)) => Status::BranchStillBroken(errors),
+        (Success(..), Failure(errors)) => Status::ProblemsIntroduced(errors),
+        (Failure(..), Success(..)) => Status::BranchHealed,
         (Success(base), Success(main)) => {
-            // Both base and main branch succeed, check ratchet state
+            // Both base and main branch succeed. Check ratchet state between them...
             match ratchet::Nixpkgs::compare(base, main) {
-                Failure(errors) => {
-                    for error in errors {
-                        writeln!(error_writer, "{}", error.to_string().red())?
-                    }
-                    writeln!(
-                        error_writer,
-                        "{}",
-                        "This PR introduces additional instances of discouraged patterns as \
-                        listed above. Merging is discouraged but would not break the base branch."
-                            .yellow()
-                    )?;
-
-                    Ok(false)
-                }
-                Success(()) => {
-                    writeln!(error_writer, "{}", "Validated successfully".green())?;
-                    Ok(true)
-                }
+                Failure(errors) => Status::DiscouragedPatternedIntroduced(errors),
+                Success(..) => Status::ValidatedSuccessfully,
             }
         }
     }
@@ -151,38 +94,38 @@ pub fn process<W: io::Write>(
 /// This does not include ratchet checks, see ../README.md#ratchet-checks
 /// Instead a `ratchet::Nixpkgs` value is returned, whose `compare` method allows performing the
 /// ratchet check against another result.
-pub fn check_nixpkgs(nixpkgs_path: &Path) -> validation::Result<ratchet::Nixpkgs> {
+fn check_nixpkgs(nixpkgs_path: &Path) -> validation::Result<ratchet::Nixpkgs> {
+    let nixpkgs_path = nixpkgs_path.canonicalize().with_context(|| {
+        format!(
+            "Nixpkgs path {} could not be resolved",
+            nixpkgs_path.display()
+        )
+    })?;
+
+    if !nixpkgs_path.join(utils::BASE_SUBPATH).exists() {
+        // No pkgs/by-name directory, always valid
+        return Ok(Success(ratchet::Nixpkgs::default()));
+    }
+
     let mut nix_file_store = NixFileStore::default();
+    let structure = check_structure(&nixpkgs_path, &mut nix_file_store)?;
 
-    Ok({
-        let nixpkgs_path = nixpkgs_path.canonicalize().with_context(|| {
-            format!(
-                "Nixpkgs path {} could not be resolved",
-                nixpkgs_path.display()
-            )
-        })?;
+    // Only if we could successfully parse the structure, we do the evaluation checks
+    let result = structure.result_map(|package_names| {
+        eval::check_values(&nixpkgs_path, &mut nix_file_store, package_names)
+    })?;
 
-        if !nixpkgs_path.join(utils::BASE_SUBPATH).exists() {
-            // No pkgs/by-name directory, always valid
-            Success(ratchet::Nixpkgs::default())
-        } else {
-            check_structure(&nixpkgs_path, &mut nix_file_store)?.result_map(|package_names| {
-                // Only if we could successfully parse the structure, we do the evaluation checks
-                eval::check_values(&nixpkgs_path, &mut nix_file_store, package_names)
-            })?
-        }
-    })
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::process;
-    use crate::utils;
     use anyhow::Context;
-    use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
     use tempfile::{tempdir_in, TempDir};
+
+    use super::{process, utils::BASE_SUBPATH};
 
     #[test]
     fn tests_dir() -> anyhow::Result<()> {
@@ -198,7 +141,7 @@ mod tests {
             let expected_errors = fs::read_to_string(path.join("expected"))
                 .with_context(|| format!("No expected file for test {name}"))?;
 
-            test_nixpkgs(&name, &path, &expected_errors)?;
+            test_nixpkgs(&name, &path, &expected_errors);
         }
         Ok(())
     }
@@ -222,7 +165,7 @@ mod tests {
             return Ok(());
         }
 
-        let base = path.join(utils::BASE_SUBPATH);
+        let base = path.join(BASE_SUBPATH);
 
         fs::create_dir_all(base.join("fo/foo"))?;
         fs::write(base.join("fo/foo/package.nix"), "{ someDrv }: someDrv")?;
@@ -236,8 +179,7 @@ mod tests {
             "pkgs/by-name/fo: Duplicate case-sensitive package directories \"foO\" and \"foo\".\n\
             This PR introduces the problems listed above. Please fix them before merging, \
             otherwise the base branch would break.\n",
-        )?;
-
+        );
         Ok(())
     }
 
@@ -266,10 +208,11 @@ mod tests {
                 Path::new("tests/success"),
                 "Validated successfully\n",
             )
-        })
+        });
+        Ok(())
     }
 
-    fn test_nixpkgs(name: &str, path: &Path, expected_errors: &str) -> anyhow::Result<()> {
+    fn test_nixpkgs(name: &str, path: &Path, expected_errors: &str) {
         // Match the expected errors almost verbatim -- `@REDACTED@` turns into `.*`.
         let pattern = format!(
             "^{}$",
@@ -278,35 +221,27 @@ mod tests {
 
         let expected_errors_regex = regex::RegexBuilder::new(&pattern)
             .dot_matches_new_line(true)
-            .build()?;
+            .build()
+            .expect("valid regex");
 
+        let path = path.to_owned();
         let base_path = path.join("base");
         let base_nixpkgs = if base_path.exists() {
-            base_path.as_path()
+            base_path
         } else {
-            Path::new("tests/empty-base")
+            Path::new("tests/empty-base").to_owned()
         };
 
         // Empty dir, needed so that no warnings are printed when testing older Nix versions
         // that don't recognise certain newer keys in nix.conf
-        let nix_conf_dir = tempdir()?;
+        let nix_conf_dir = tempdir().expect("directory");
+        let nix_conf_dir = nix_conf_dir.path().as_os_str();
 
-        // We don't want coloring to mess up the tests
-        let writer = temp_env::with_vars(
-            [
-                ("NO_COLOR", Some(OsStr::new("1"))),
-                // See above comment on nix_conf_dir
-                ("NIX_CONF_DIR", Some(nix_conf_dir.path().as_os_str())),
-            ],
-            || -> anyhow::Result<_> {
-                let mut writer = vec![];
-                process(base_nixpkgs.to_owned(), path.to_owned(), &mut writer)
-                    .with_context(|| format!("Failed test case {name}"))?;
-                Ok(writer)
-            },
-        )?;
+        let status = temp_env::with_var("NIX_CONF_DIR", Some(nix_conf_dir), || {
+            process(base_nixpkgs, path)
+        });
 
-        let actual_errors = String::from_utf8_lossy(&writer);
+        let actual_errors = format!("{status}\n");
 
         if !expected_errors_regex.is_match(&actual_errors) {
             panic!(
@@ -315,7 +250,6 @@ mod tests {
                 expected_errors, actual_errors
             );
         }
-        Ok(())
     }
 
     /// Check whether a path is in a case-insensitive filesystem
