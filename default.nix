@@ -5,13 +5,15 @@ in
   system ? builtins.currentSystem,
   nixpkgs ? sources.nixpkgs,
   treefmt-nix ? sources.treefmt-nix,
+  pkgs ? (
+    import nixpkgs {
+      inherit system;
+      config = { };
+      overlays = [ ];
+    }
+  ),
 }:
 let
-  pkgs = import nixpkgs {
-    inherit system;
-    config = { };
-    overlays = [ ];
-  };
   inherit (pkgs) lib;
 
   # Needed to make Nix evaluation work inside nix builds
@@ -75,10 +77,30 @@ let
       }
     );
 
+    # Fits in with `nix fmt`.
+    treefmtWrapper = treefmtEval.config.build.wrapper;
+
     # Run regularly by CI and turned into a PR
     autoPrUpdate =
       let
         updateScripts = {
+          flake = pkgs.writeShellApplication {
+            name = "update-flake";
+            runtimeInputs = with pkgs; [
+              git
+              nix
+            ];
+            text = ''
+              echo "<details><summary>flake.nix changes</summary>"
+              # Needed because GitHub's rendering of the first body line breaks down otherwise
+              echo ""
+              echo '```'
+              cd "$1"
+              nix flake update 2>&1
+              echo  '```'
+              echo "</details>"
+            '';
+          };
           npins = pkgs.writeShellApplication {
             name = "update-npins";
             runtimeInputs = with pkgs; [ npins ];
@@ -87,7 +109,7 @@ let
               # Needed because GitHub's rendering of the first body line breaks down otherwise
               echo ""
               echo '```'
-              npins update --directory "$1/npins" 2>&1
+              npins --directory "$1/npins" import-flake 2>&1
               echo  '```'
               echo "</details>"
             '';
