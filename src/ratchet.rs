@@ -19,6 +19,7 @@ pub struct Nixpkgs {
     /// The ratchet values for all packages
     pub packages: BTreeMap<String, Package>,
     pub files: BTreeMap<RelativePathBuf, File>,
+    pub nixos_tests: BTreeMap<RelativePathBuf, NixosTest>,
 }
 
 impl Nixpkgs {
@@ -33,6 +34,9 @@ impl Nixpkgs {
         )
         .and_(validation::sequence_(to.files.into_iter().map(
             |(name, file)| File::compare(&name, from.files.get(&name), &file),
+        )))
+        .and_(validation::sequence_(to.nixos_tests.into_iter().map(
+            |(name, test)| NixosTest::compare(&name, from.nixos_tests.get(&name), &test),
         )))
     }
 }
@@ -76,6 +80,18 @@ pub struct File {}
 
 impl File {
     /// Validates the ratchet checks for a top-level package
+    pub fn compare(
+        _name: &RelativePath,
+        _optional_from: Option<&Self>,
+        _to: &Self,
+    ) -> Validation<()> {
+        Success(())
+    }
+}
+
+pub struct NixosTest {}
+
+impl NixosTest {
     pub fn compare(
         _name: &RelativePath,
         _optional_from: Option<&Self>,

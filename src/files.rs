@@ -21,14 +21,20 @@ use crate::{ratchet, structure, validation};
 pub fn check_files(
     nixpkgs_path: &Path,
     nix_file_store: &mut NixFileStore,
+    files: &[RelativePathBuf],
 ) -> validation::Result<BTreeMap<RelativePathBuf, ratchet::File>> {
-    process_nix_files(nixpkgs_path, nix_file_store, |relative_path, nix_file| {
-        let result = sequence_([
-            check_executable_iff_shebang(relative_path, &nix_file.path)?,
-            check_invalid_escapes(relative_path, nix_file)?,
-        ]);
-        Ok(result.map(|()| ratchet::File {}))
-    })
+    process_nix_files(
+        nixpkgs_path,
+        nix_file_store,
+        files,
+        |relative_path, nix_file| {
+            let result = sequence_([
+                check_executable_iff_shebang(relative_path, &nix_file.path)?,
+                check_invalid_escapes(relative_path, nix_file)?,
+            ]);
+            Ok(result.map(|()| ratchet::File {}))
+        },
+    )
 }
 
 /// Processes all Nix files in a Nixpkgs directory according to a given function `f`, collecting the
@@ -36,20 +42,14 @@ pub fn check_files(
 fn process_nix_files(
     nixpkgs_path: &Path,
     nix_file_store: &mut NixFileStore,
+    files: &[RelativePathBuf],
     f: impl Fn(&RelativePath, &NixFile) -> validation::Result<ratchet::File>,
 ) -> validation::Result<BTreeMap<RelativePathBuf, ratchet::File>> {
-    // Get all Nix files
-    let files = {
-        let mut files = vec![];
-        collect_nix_files(nixpkgs_path, &RelativePathBuf::new(), &mut files)?;
-        files
-    };
-
-    let results = ResultIteratorExt::collect_vec(files.into_iter().map(|path| {
+    let results = ResultIteratorExt::collect_vec(files.iter().map(|path| {
         // Get the (optionally-cached) parsed Nix file
         let nix_file = nix_file_store.get(&path.to_path(nixpkgs_path))?;
-        let result = f(&path, nix_file)?;
-        let val = result.map(|ratchet| (path, ratchet));
+        let result = f(path, nix_file)?;
+        let val = result.map(|ratchet| (path.clone(), ratchet));
         Ok::<_, anyhow::Error>(val)
     }))?;
 
@@ -158,9 +158,15 @@ fn check_invalid_escapes(
     }
 }
 
-/// Recursively collects all Nix files in the relative `dir` within `base`
-/// into the `files` `Vec`.
-fn collect_nix_files(
+/// Collects all Nix files in `base` recursively.
+pub fn collect_nix_files(base: &Path) -> anyhow::Result<Vec<RelativePathBuf>> {
+    let mut files = vec![];
+    collect_nix_files_in(base, &RelativePathBuf::new(), &mut files)?;
+    Ok(files)
+}
+
+/// Recursively collects all Nix files in the relative `dir` within `base` into `files`.
+fn collect_nix_files_in(
     base: &Path,
     dir: &RelativePath,
     files: &mut Vec<RelativePathBuf>,
@@ -176,7 +182,7 @@ fn collect_nix_files(
             continue;
         }
         if absolute_path.is_dir() {
-            collect_nix_files(base, &relative_path, files)?
+            collect_nix_files_in(base, &relative_path, files)?
         } else if absolute_path.extension().is_some_and(|x| x == "nix") {
             files.push(relative_path)
         }
