@@ -99,3 +99,6 @@ The current ratchets are:
   - Once a top-level package evaluates with `strictDeps = true`, it also can't regress to `false`.
 - New top-level packages must evaluate with `__structuredAttrs = true`.
   - Once a top-level package evaluates with `__structuredAttrs = true`, it also can't regress to `false`.
+- New NixOS test modules passed by path to `runTest` or `runTestOn` must not take the obsolete `pkgs` module argument.
+  - Once a NixOS test module stops taking `pkgs`, it also can't regress to taking it.
+  Use `config.node.pkgs` for guest packages or `hostPkgs` for host packages.

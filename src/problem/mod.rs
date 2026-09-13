@@ -34,6 +34,8 @@ pub mod npv_166;
 pub mod npv_167;
 
 pub mod npv_170;
+pub mod npv_172;
+pub mod npv_173;
 
 const WIKI_BASE_URL: &str = "https://github.com/NixOS/nixpkgs-vet/wiki";
 
@@ -124,6 +126,12 @@ pub enum Problem {
 
     /// NPV-170: nix files should not contain useless escapes
     NixFileContainsUselessEscape(npv_170::NixFileContainsUselessEscape),
+
+    /// NPV-172: new NixOS test uses the pkgs module argument
+    NewNixosTestUsesPkgs(npv_172::NewNixosTestUsesPkgs),
+
+    /// NPV-173: NixOS test started using the pkgs module argument
+    NixosTestStartedUsingPkgs(npv_173::NixosTestStartedUsingPkgs),
 }
 
 impl Problem {
@@ -158,6 +166,8 @@ impl Problem {
             Self::NewTopLevelPackageMustEnableStructuredAttrs(..) => "NPV-166",
             Self::TopLevelPackageDisabledStructuredAttrs(..) => "NPV-167",
             Self::NixFileContainsUselessEscape(..) => "NPV-170",
+            Self::NewNixosTestUsesPkgs(..) => "NPV-172",
+            Self::NixosTestStartedUsingPkgs(..) => "NPV-173",
         }
     }
 
@@ -198,6 +208,8 @@ impl fmt::Display for Problem {
             Self::NewTopLevelPackageMustEnableStructuredAttrs(inner) => inner.fmt(f),
             Self::TopLevelPackageDisabledStructuredAttrs(inner) => inner.fmt(f),
             Self::NixFileContainsUselessEscape(inner) => inner.fmt(f),
+            Self::NewNixosTestUsesPkgs(inner) => inner.fmt(f),
+            Self::NixosTestStartedUsingPkgs(inner) => inner.fmt(f),
         }
     }
 }

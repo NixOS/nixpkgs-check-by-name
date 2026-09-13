@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use relative_path::RelativePathBuf;
+use relative_path::{RelativePath, RelativePathBuf};
 use rnix::ast;
 use rowan::ast::AstNode;
 
-use crate::nix_file::{NixFileStore, ResolvedPath};
-use crate::ratchet;
+use crate::location::Location;
+use crate::nix_file::{NixFile, NixFileStore, ResolvedPath};
+use crate::ratchet::{self, RatchetState};
 
 const NIXOS_TESTS: &str = "nixos/tests";
 
@@ -54,9 +55,44 @@ pub fn find_nixos_tests(
 
     let mut tests = BTreeMap::new();
     for relative_path in test_paths {
-        tests.insert(relative_path, ratchet::NixosTest {});
+        let nix_file = nix_file_store.get(&relative_path.to_path(nixpkgs_path))?;
+        let uses_pkgs = pkgs_argument_location(&relative_path, nix_file)
+            .map_or(RatchetState::Tight, RatchetState::Loose);
+        tests.insert(relative_path, ratchet::NixosTest { uses_pkgs });
     }
+
     Ok(tests)
+}
+
+fn pkgs_argument_location(relative_path: &RelativePath, nix_file: &NixFile) -> Option<Location> {
+    let pattern = outer_function_pattern(nix_file.syntax_root.expr()?)?;
+
+    pattern.pat_entries().find_map(|entry| {
+        let identifier = entry.ident()?;
+        if identifier.ident_token()?.text() != "pkgs" {
+            return None;
+        }
+
+        let index: usize = identifier.syntax().text_range().start().into();
+        Some(Location::new(
+            relative_path,
+            nix_file.line_index.line(index),
+            nix_file.line_index.column(index),
+        ))
+    })
+}
+
+fn outer_function_pattern(expression: ast::Expr) -> Option<ast::Pattern> {
+    match expression {
+        // ({ pkgs, ... }: ...) -> { pkgs, ... }: ...
+        ast::Expr::Paren(parenthesized) => outer_function_pattern(parenthesized.expr()?),
+        // { pkgs, ... }: ... -> { pkgs, ... }
+        ast::Expr::Lambda(lambda) => match lambda.param()? {
+            ast::Param::Pattern(pattern) => Some(pattern),
+            ast::Param::IdentParam(_) => None,
+        },
+        _ => None,
+    }
 }
 
 fn applied_function_name(expression: ast::Expr) -> Option<String> {
@@ -142,6 +178,41 @@ mod tests {
         .collect();
 
         assert_eq!(actual, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn detects_pkgs_argument() -> anyhow::Result<()> {
+        let temp_nixpkgs = tempdir()?;
+        let mut nix_file_store = NixFileStore::default();
+
+        for (name, contents, expected) in [
+            ("direct.nix", "{ pkgs, ... }: {}", Some((1, 3))),
+            ("parenthesized.nix", "({ pkgs, ... }: {})", Some((1, 4))),
+            (
+                "nested.nix",
+                "{ config, ... }: { nodes.machine = { pkgs, ... }: {}; }",
+                None,
+            ),
+            ("identifier.nix", "args: {}", None),
+            ("attrs.nix", "{}", None),
+        ] {
+            let path = temp_nixpkgs.path().join(name);
+            fs::write(&path, contents)?;
+
+            let relative_path = RelativePathBuf::from(name);
+            let actual = pkgs_argument_location(&relative_path, nix_file_store.get(&path)?);
+            assert_eq!(
+                actual
+                    .as_ref()
+                    .map(|location| (location.line, location.column)),
+                expected,
+            );
+            if let Some(location) = actual {
+                assert_eq!(location.file, relative_path);
+            }
+        }
+
         Ok(())
     }
 }
