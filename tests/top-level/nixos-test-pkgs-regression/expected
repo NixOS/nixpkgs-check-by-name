@@ -1,0 +1,4 @@
+- nixos/tests/example.nix: line 1, column 3 previously did not declare the obsolete `pkgs` module argument, but now does.
+  Use `config.node.pkgs` for guest packages or `hostPkgs` for host packages.
+ (https://github.com/NixOS/nixpkgs-vet/wiki/NPV-173)
+This PR introduces additional instances of discouraged patterns as listed above. Please fix them before merging.

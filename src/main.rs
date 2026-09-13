@@ -13,6 +13,7 @@ mod eval;
 mod files;
 mod location;
 mod nix_file;
+mod nixos_tests;
 mod problem;
 mod ratchet;
 mod references;
@@ -116,6 +117,7 @@ fn check_nixpkgs(nixpkgs_path: &Path) -> validation::Result<ratchet::Nixpkgs> {
     })?;
 
     let mut nix_file_store = NixFileStore::default();
+    let nix_files = files::collect_nix_files(&nixpkgs_path)?;
 
     let package_result = {
         if !nixpkgs_path.join(structure::BASE_SUBPATH).exists() {
@@ -131,12 +133,15 @@ fn check_nixpkgs(nixpkgs_path: &Path) -> validation::Result<ratchet::Nixpkgs> {
         }
     };
 
-    let file_result = files::check_files(&nixpkgs_path, &mut nix_file_store)?;
+    let file_result = files::check_files(&nixpkgs_path, &mut nix_file_store, &nix_files)?;
+    let nixos_tests =
+        nixos_tests::find_nixos_tests(&nixpkgs_path, &mut nix_file_store, &nix_files)?;
 
     Ok(
         package_result.and(file_result, |packages, files| ratchet::Nixpkgs {
             packages,
             files,
+            nixos_tests,
         }),
     )
 }

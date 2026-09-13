@@ -9,8 +9,11 @@ use std::collections::BTreeMap;
 
 use relative_path::RelativePathBuf;
 
+use crate::location::Location;
 use crate::nix_file::CallPackageArgumentInfo;
-use crate::problem::{Problem, npv_160, npv_162, npv_164, npv_165, npv_166, npv_167};
+use crate::problem::{
+    Problem, npv_160, npv_162, npv_164, npv_165, npv_166, npv_167, npv_172, npv_173,
+};
 use crate::validation::{self, Validation, Validation::Success};
 
 /// The ratchet value for the entirety of Nixpkgs.
@@ -19,6 +22,7 @@ pub struct Nixpkgs {
     /// The ratchet values for all packages
     pub packages: BTreeMap<String, Package>,
     pub files: BTreeMap<RelativePathBuf, File>,
+    pub nixos_tests: BTreeMap<RelativePathBuf, NixosTest>,
 }
 
 impl Nixpkgs {
@@ -33,6 +37,9 @@ impl Nixpkgs {
         )
         .and_(validation::sequence_(to.files.into_iter().map(
             |(name, file)| File::compare(&name, from.files.get(&name), &file),
+        )))
+        .and_(validation::sequence_(to.nixos_tests.into_iter().map(
+            |(name, test)| NixosTest::compare(&name, from.nixos_tests.get(&name), &test),
         )))
     }
 }
@@ -85,6 +92,20 @@ impl File {
     }
 }
 
+pub struct NixosTest {
+    pub uses_pkgs: RatchetState<NixosTestUsesPkgs>,
+}
+
+impl NixosTest {
+    pub fn compare(name: &RelativePath, optional_from: Option<&Self>, to: &Self) -> Validation<()> {
+        RatchetState::<NixosTestUsesPkgs>::compare(
+            name.as_str(),
+            optional_from.map(|test| &test.uses_pkgs),
+            &to.uses_pkgs,
+        )
+    }
+}
+
 /// The ratchet state of a generic ratchet check.
 pub enum RatchetState<Ratchet: ToProblem> {
     /// The ratchet is loose. It can be tightened more. In other words, this is the legacy state
@@ -110,6 +131,20 @@ pub trait ToProblem {
 
     /// How to convert an attribute-specific error context into a Problem.
     fn to_problem(name: &str, optional_from: Option<()>, to: &Self::ToContext) -> Problem;
+}
+
+pub enum NixosTestUsesPkgs {}
+
+impl ToProblem for NixosTestUsesPkgs {
+    type ToContext = Location;
+
+    fn to_problem(_name: &str, optional_from: Option<()>, location: &Location) -> Problem {
+        if optional_from.is_some() {
+            npv_173::NixosTestStartedUsingPkgs::new(location.clone()).into()
+        } else {
+            npv_172::NewNixosTestUsesPkgs::new(location.clone()).into()
+        }
+    }
 }
 
 impl<Context: ToProblem> RatchetState<Context> {
